@@ -175,7 +175,7 @@ class DALVEC:
 
             self.database.commit()
 
-    def create_embedding(self, context: str):
+    def create_embedding(self, context: str, version: int = None):
         """
         Creates an embedding for a given context and stores it in the database.
 
@@ -184,11 +184,44 @@ class DALVEC:
         """
         embedding = self.embedding_function.embed_query(context)
         embedding_blob = pickle.dumps(embedding)
-        self.database.embedding.insert(
+        vector_id = self.database.embedding.insert(
             vector=embedding_blob,
             context=context
         )
+
+        if self.database.clusters.isempty():
+            return vector_id
+
+        return self._insert_cluster(version, embedding, vector_id)
+
+    def _insert_cluster(self, version, embedding, vector_id):
+        if version is None:
+            kmeans_loaded = self.database.select(self.database.kmeans.ALL,
+                                                 orderby=~self.database.kmeans.version).first()
+        else:
+            query = self.database(self.database.kmeans.version == version)
+            if query.isempty():
+                raise ValueError(f"Version {version} of kmeans not found.")
+            kmeans_loaded = query.select(self.database.kmeans.ALL,
+                                         orderby=~self.database.kmeans.version).first()
+
+        kmeans = pickle.loads(kmeans_loaded.kmeans)
+
+        label = kmeans.predict(embedding)
+
+        cluster = self.database(
+            (self.database.clusters.label == label)
+            &
+            (self.database.clusters.kmeans_id == kmeans_loaded.id)
+        ).select(self.database.clusters.ALL).first()
+
+        self.database.vector_cluster.insert(
+            vector_id=vector_id,
+            cluster_id=cluster.id
+        )
+
         self.database.commit()
+        return vector_id
 
     def get_vector_from_blob(self, blob_vector):
         """
@@ -203,24 +236,69 @@ class DALVEC:
         vector = pickle.loads(blob_vector)
         return np.array(vector)
 
-    def batch_embedding(self, contexts: List[str]):
+    def _batch_embedding(self, contexts: List[str]):
+        qemb = DALVEC.embed_chunk(contexts, self.embedding_function)
+        vector_ids = [
+            self.database.embedding.insert(
+                vector=pickle.dumps(qemb[i]),
+                context=context
+            ) for i, context in enumerate(contexts)
+        ]
+
+        self.database.commit()
+        return vector_ids
+
+    def batch_embedding(self, contexts: List[str], version: int = None):
         """
         Generates and stores embeddings for a batch of contexts.
 
         Args:
             contexts (List[str]): A list of contexts to be embedded.
         """
+
+        if self.database.clusters.isempty():
+            return self._batch_embedding(contexts)
+
         qemb = DALVEC.embed_chunk(contexts, self.embedding_function)
+
+        if version is None:
+            kmeans_loaded = self.database.select(self.database.kmeans.ALL,
+                                                 orderby=~self.database.kmeans.version).first()
+        else:
+            query = self.database(self.database.kmeans.version == version)
+            if query.isempty():
+                raise ValueError(f"Version {version} of kmeans not found.")
+            kmeans_loaded = query.select(self.database.kmeans.ALL,
+                                         orderby=~self.database.kmeans.version).first()
+
+        kmeans = pickle.loads(kmeans_loaded.kmeans)
+
+        vector_ids = []
 
         # Store embeddings in the database
         for i, context in enumerate(contexts):
             embedding_blob = pickle.dumps(qemb[i])
-            self.database.embedding.insert(
+            label = kmeans.predict(qemb[i])
+
+            vector_id = self.database.embedding.insert(
                 vector=embedding_blob,
                 context=context
             )
+            vector_ids.append(vector_id)
+
+            cluster = self.database(
+                (self.database.clusters.label == label)
+                &
+                (self.database.clusters.kmeans_id == kmeans_loaded.id)
+            ).select(self.database.clusters.ALL).first()
+
+            self.database.vector_cluster.insert(
+                vector_id=vector_id,
+                cluster_id=cluster.id
+            )
 
         self.database.commit()
+        return vector_ids
 
     def clustering(self, n_clusters: int = 3):
         """
@@ -348,8 +426,10 @@ class DALVEC:
         filtered_cluster_ids = [
             rows_clusters[i].id  # Pega o ID do cluster
             for i, sincenter in enumerate(centroid_similarities)
-            if sincenter >= threshold
+            if sincenter >= threshold - np.ceil(100 * threshold * 0.3) / 100
         ]
+        if len(filtered_cluster_ids) == 0:
+            return []
 
         # Busca os IDs dos vetores que pertencem aos clusters filtrados
         vector_ids = self.database(
@@ -366,6 +446,9 @@ class DALVEC:
         # Constrói uma matriz de vetores a partir dos vetores encontrados
         vectors = np.vstack([self.get_vector_from_blob(row.vector)
                             for row in vectors_from_cluster])  # (n, m)
+
+        if vectors.size == 0:
+            return []
 
         # Calcula as similaridades entre a embedding da consulta e os vetores encontrados
         similarities = self.calc_similarities(query_embedding, vectors)
