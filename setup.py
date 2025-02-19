@@ -26,6 +26,7 @@ setup(
                       "orjson == 3.10.6",
                       "langchain",
                       "pydal",
-                      "sentence_transformers"
+                      "sentence_transformers",
+                      "scikit-learn"
                       ],
 )
